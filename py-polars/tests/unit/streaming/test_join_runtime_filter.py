@@ -866,3 +866,35 @@ def test_range_is_judged_against_the_scan_it_prunes(
     assert groups == "1 / 10 row groups"
     assert out.get_column("k").to_list() == [540]
     assert_matches_in_memory(q, out)
+
+
+def test_range_published_after_the_scan_opened_prunes_the_rest(
+    tmp_path: Path, plmonkeypatch: PlMonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    # The preferred side outgrows the sample, so both sides are sampled and the scan
+    # opens before the range is published. The sample still picks the planned side,
+    # and the row groups not fetched by then are judged again.
+    n, rg = 1_000_000, 2_000
+    path = tmp_path / "fact.parquet"
+    pl.DataFrame(
+        {"k": range(n), "v": range(n), "w": [f"{i:0>40}" for i in range(n)]}
+    ).write_parquet(path, row_group_size=rg, statistics="full")
+    lo = n * 8 // 10
+    keys = list(range(lo, lo + rg * 30, 50))
+    a = pl.LazyFrame({"k": list(range(0, n, 50)), "d": list(range(n // 50))})
+    b = pl.LazyFrame({"k": list(range(0, n, 50)), "e": list(range(n // 50))})
+    build = a.join(b, on="k").filter(pl.col("k").is_in(keys))
+
+    plmonkeypatch.setenv("POLARS_JOIN_SAMPLE_LIMIT", "1000")
+    q = pl.scan_parquet(path).join(build, on="k")
+    assert "BUILD SIDE: Prefer" in q.explain(engine="streaming")
+
+    plmonkeypatch.setenv("POLARS_VERBOSE", "1")
+    capfd.readouterr()
+    out = q.collect(engine="streaming")
+    err = capfd.readouterr().err
+    assert "Predicate pushdown: reading 500 / 500 row groups" in err
+    # Whether any row group was still unfetched at publication depends on timing.
+    skipped = [line for line in err.splitlines() if "dynamic predicate set" in line]
+    assert len(skipped) <= 1
+    assert out.get_column("k").sort().to_list() == keys

@@ -10,7 +10,7 @@ use polars_core::prelude::{
 use polars_core::schema::Schema;
 use polars_error::polars_warn;
 use polars_expr::{ExpressionConversionState, create_physical_expr};
-use polars_io::predicates::ScanIOPredicate;
+use polars_io::predicates::{ScanIOPredicate, SkipBatchVersion};
 use polars_plan::dsl::default_values::{DefaultFieldValues, IcebergDefaultFieldValues};
 use polars_plan::dsl::deletion::DeletionFilesList;
 use polars_plan::dsl::{
@@ -21,7 +21,9 @@ use polars_plan::plans::hive::HivePartitionsDf;
 use polars_plan::plans::predicates::{
     aexpr_to_column_predicates, aexpr_to_skip_batch_predicate, null_count_dtype,
 };
-use polars_plan::plans::{AExpr, ExprIRDisplay, FileInfo, IR, IRFunctionExpr, MintermIter};
+use polars_plan::plans::{
+    AExpr, DynamicPredWeakRef, ExprIRDisplay, FileInfo, IR, IRFunctionExpr, MintermIter,
+};
 use polars_plan::utils::aexpr_to_leaf_names_iter;
 use polars_utils::aliases::PlIndexMapHashable;
 use polars_utils::arena::{Arena, Node};
@@ -221,12 +223,36 @@ pub fn create_scan_predicate(
         }
     };
 
+    // The dynamic parts of the skip-batch predicate, whose versions add up to its own.
+    let dynamic_preds: Vec<DynamicPredWeakRef> = skip_batch_predicate
+        .is_some()
+        .then(|| {
+            let mut preds = Vec::new();
+            let mut stack = vec![full_predicate.node()];
+            while let Some(node) = stack.pop() {
+                let ae = expr_arena.get(node);
+                if let AExpr::Function {
+                    function: IRFunctionExpr::DynamicPred { pred, .. },
+                    ..
+                } = ae
+                {
+                    preds.push(pred.clone());
+                }
+                ae.inputs_rev(&mut stack);
+            }
+            preds
+        })
+        .unwrap_or_default();
+    let skip_batch_version: Option<SkipBatchVersion> = (!dynamic_preds.is_empty())
+        .then(|| Arc::new(move || dynamic_preds.iter().map(|p| p.version()).sum()) as _);
+
     PolarsResult::Ok(ScanPredicate {
         predicate: phys_predicate,
         filters_rows,
         live_columns,
         skip_batch_columns,
         skip_batch_predicate,
+        skip_batch_version,
         column_predicates,
         hive_predicate,
         hive_predicate_is_full_predicate,

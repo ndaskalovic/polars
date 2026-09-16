@@ -7,6 +7,7 @@ use polars_core::runtime::ASYNC;
 use polars_core::series::IsSorted;
 use polars_core::utils::arrow::bitmap::Bitmap;
 use polars_error::PolarsResult;
+use polars_io::RowIndex;
 use polars_io::predicates::ScanIOPredicate;
 use polars_io::prelude::{FileMetadata, create_sorting_map};
 use polars_io::utils::byte_source::{ByteSource, DynByteSource};
@@ -14,6 +15,7 @@ use polars_parquet::read::RowGroupMetadata;
 use polars_utils::pl_str::PlSmallStr;
 
 use crate::nodes::io_sources::parquet::projection::ArrowFieldProjection;
+use crate::nodes::io_sources::parquet::statistics::calculate_row_group_pred_pushdown_skip_mask;
 use crate::utils::tokio_handle_ext;
 
 /// Represents byte-data that can be transformed into a DataFrame after some computation.
@@ -28,20 +30,61 @@ pub(super) struct RowGroupData {
 pub(super) struct RowGroupDataFetcher {
     pub(super) projection: Arc<[ArrowFieldProjection]>,
     pub(super) is_full_projection: bool,
-    #[allow(unused)] // TODO: Fix!
     pub(super) predicate: Option<ScanIOPredicate>,
     pub(super) slice_range: Option<Range<usize>>,
     pub(super) memory_prefetch_func: fn(&[u8]) -> (),
     pub(super) metadata: Arc<FileMetadata>,
     pub(super) byte_source: Arc<DynByteSource>,
+    pub(super) use_statistics: bool,
+    pub(super) row_index: Option<RowIndex>,
+    pub(super) verbose: bool,
 
     pub(super) row_group_slice: Range<usize>,
+    /// Which of the row groups in `row_group_slice` to skip, if any.
     pub(super) row_group_mask: Option<Bitmap>,
+    /// The version of the predicate's dynamic parts the mask was made with.
+    pub(super) mask_version: u64,
 
     pub(super) row_offset: usize,
 }
 
 impl RowGroupDataFetcher {
+    /// The version of the predicate's dynamic parts right now.
+    pub(super) fn skip_batch_version(predicate: Option<&ScanIOPredicate>) -> u64 {
+        predicate
+            .and_then(|p| p.skip_batch_version.as_ref())
+            .map_or(0, |version| version())
+    }
+
+    /// Evaluate the mask for the row groups not yet fetched again if a dynamic
+    /// part of the predicate was set since it was made.
+    pub(super) async fn refresh_mask(&mut self) -> PolarsResult<()> {
+        let version = Self::skip_batch_version(self.predicate.as_ref());
+        if version == self.mask_version || self.row_group_slice.is_empty() {
+            return Ok(());
+        }
+        self.mask_version = version;
+        self.row_group_mask = calculate_row_group_pred_pushdown_skip_mask(
+            self.row_group_slice.clone(),
+            self.use_statistics,
+            self.predicate.as_ref(),
+            &self.metadata,
+            self.projection.clone(),
+            self.row_index.clone(),
+            false,
+        )
+        .await?;
+        if self.verbose {
+            let skipped = self.row_group_mask.as_ref().map_or(0, |m| m.set_bits());
+            eprintln!(
+                "[ParquetFileReader]: Predicate pushdown: dynamic predicate set, \
+                skipping {skipped} / {} remaining row groups",
+                self.row_group_slice.len()
+            );
+        }
+        Ok(())
+    }
+
     /// Returns the projected byte size of the next row group to be fetched, without advancing
     /// state or spawning any I/O. Returns None if there are no more row groups.
     pub(super) fn peek_next_bytes(&self) -> Option<u64> {

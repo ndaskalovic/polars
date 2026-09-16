@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::hash::Hash;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{RwLock, Weak};
 
 use polars_utils::unique_id::UniqueId;
@@ -41,6 +41,9 @@ struct Inner {
     pred: RwLock<Option<Arc<dyn PredicateExpr>>>,
     #[cfg_attr(feature = "ir_serde", serde(skip))]
     is_set: AtomicBool,
+    /// Incremented by every `set`.
+    #[cfg_attr(feature = "ir_serde", serde(skip))]
+    version: AtomicU64,
     id: UniqueId,
 }
 
@@ -96,6 +99,7 @@ impl DynamicPred {
             inner: Arc::new(Inner {
                 pred: Default::default(),
                 is_set: Default::default(),
+                version: Default::default(),
                 id: UniqueId::new(),
             }),
         }
@@ -119,12 +123,20 @@ impl DynamicPred {
             *guard = Some(pred);
         }
         self.inner.is_set.store(true, Ordering::Release);
+        self.inner.version.fetch_add(1, Ordering::Release);
     }
 }
 
 impl DynamicPredWeakRef {
     pub fn id(&self) -> Option<UniqueId> {
         Some(self.inner.upgrade()?.id)
+    }
+
+    /// The number of times the predicate was set; zero when unset or dropped.
+    pub fn version(&self) -> u64 {
+        self.inner
+            .upgrade()
+            .map_or(0, |inner| inner.version.load(Ordering::Acquire))
     }
 
     pub fn evaluate(&self, columns: &[Column]) -> PolarsResult<Column> {
@@ -195,4 +207,22 @@ fn dynamic_pred_node(
     };
 
     (arena.add(aexpr), pred)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_counts_every_set() {
+        let pred = DynamicPred::new();
+        let weak = pred.downgrade();
+        assert_eq!(weak.version(), 0);
+        pred.set(Arc::new(TrivialPredicateExpr));
+        assert_eq!(weak.version(), 1);
+        pred.set(Arc::new(TrivialPredicateExpr));
+        assert_eq!(weak.version(), 2);
+        drop(pred);
+        assert_eq!(weak.version(), 0);
+    }
 }

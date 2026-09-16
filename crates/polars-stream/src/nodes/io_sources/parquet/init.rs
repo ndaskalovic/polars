@@ -146,13 +146,14 @@ impl ParquetReadImpl {
                 }
             }
 
+            let mask_version = RowGroupDataFetcher::skip_batch_version(predicate.as_ref());
             let row_group_mask = calculate_row_group_pred_pushdown_skip_mask(
                 row_group_slice.clone(),
                 use_statistics,
                 predicate.as_ref(),
                 &metadata,
                 projected_arrow_fields.clone(),
-                row_index,
+                row_index.clone(),
                 verbose,
             )
             .await?;
@@ -165,8 +166,12 @@ impl ParquetReadImpl {
                 memory_prefetch_func,
                 metadata,
                 byte_source,
+                use_statistics,
+                row_index,
+                verbose,
                 row_group_slice,
                 row_group_mask,
+                mask_version,
                 row_offset,
             };
 
@@ -174,7 +179,11 @@ impl ParquetReadImpl {
                 rg_prefetch_prev_all_spawned.wait().await;
             }
 
-            while let Some(fetch_length) = row_group_data_fetcher.peek_next_bytes() {
+            loop {
+                row_group_data_fetcher.refresh_mask().await?;
+                let Some(fetch_length) = row_group_data_fetcher.peek_next_bytes() else {
+                    break;
+                };
                 let fetch_length = usize::try_from(fetch_length)
                     .expect("ParquetReadImpl: fetch_length too large for usize: {fetch_length}");
 

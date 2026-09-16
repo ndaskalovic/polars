@@ -13,7 +13,8 @@ use polars_error::PolarsResult;
 use polars_expr::prelude::{AggregationContext, PhysicalExpr, phys_expr_to_io_expr};
 use polars_expr::state::ExecutionState;
 use polars_io::predicates::{
-    ColumnPredicates, ScanIOPredicate, SkipBatchPredicate, SpecializedColumnPredicate,
+    ColumnPredicates, ScanIOPredicate, SkipBatchPredicate, SkipBatchVersion,
+    SpecializedColumnPredicate,
 };
 use polars_utils::pl_str::PlSmallStr;
 use polars_utils::{IdxSize, format_pl_smallstr};
@@ -41,6 +42,9 @@ pub struct ScanPredicate {
     /// `true` if the whole batch can for sure be skipped. This may be conservative and evaluate to
     /// `false` even when the batch could theoretically be skipped.
     pub skip_batch_predicate: Option<Arc<dyn PhysicalExpr>>,
+
+    /// Changes whenever a dynamic part of the skip-batch predicate is set.
+    pub skip_batch_version: Option<SkipBatchVersion>,
 
     /// Partial predicates for each column for filter when loading columnar formats.
     pub column_predicates: PhysicalColumnPredicates,
@@ -175,6 +179,7 @@ impl ScanPredicate {
             live_columns: Arc::new(live_columns),
             skip_batch_columns: Arc::new(skip_batch_columns),
             skip_batch_predicate,
+            skip_batch_version: self.skip_batch_version.clone(),
             column_predicates: self.column_predicates.clone(), // Q? Maybe this should cull
             // predicates.
             hive_predicate: None,
@@ -207,6 +212,7 @@ impl ScanPredicate {
             skip_batch_predicate: skip_batch_predicate
                 .cloned()
                 .or_else(|| self.to_dyn_skip_batch_predicate(schema)),
+            skip_batch_version: self.skip_batch_version.clone(),
             column_predicates: Arc::new(ColumnPredicates {
                 predicates: self
                     .column_predicates

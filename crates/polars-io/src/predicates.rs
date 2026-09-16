@@ -328,6 +328,8 @@ impl PhysicalIoExpr for PhysicalExprWithConstCols<Arc<dyn PhysicalIoExpr>> {
     }
 }
 
+pub type SkipBatchVersion = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ScanIOPredicate {
     pub predicate: Arc<dyn PhysicalIoExpr>,
@@ -345,6 +347,11 @@ pub struct ScanIOPredicate {
 
     /// A predicate that gets given statistics and evaluates whether a batch can be skipped.
     pub skip_batch_predicate: Option<Arc<dyn SkipBatchPredicate>>,
+
+    /// Changes whenever a part of the skip-batch predicate that a producer sets at
+    /// run time is set; a reader then evaluates the batches it has not read yet
+    /// again. `None` when the predicate has no such part.
+    pub skip_batch_version: Option<SkipBatchVersion>,
 
     /// A predicate that gets given statistics and evaluates whether a batch can be skipped.
     pub column_predicates: Arc<ColumnPredicates>,
