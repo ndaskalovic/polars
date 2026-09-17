@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -752,3 +753,91 @@ def test_streaming_merge_join_send_port_done_27547() -> None:
     expected = q.collect(engine="in-memory")
     actual = q.collect(engine="streaming")
     assert_frame_equal(actual, expected)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="needs unix-only `resource` module to measure memory usage",
+)
+def test_streaming_asof_join_memory_usage_28527() -> None:
+    """A grouped asof join must not buffer every right-side match of every group
+    in a left morsel at once.
+
+    https://github.com/pola-rs/polars/issues/28527
+    """
+    import os
+    import subprocess
+
+    script = """\
+import resource
+import sys
+
+import numpy as np
+import polars as pl
+
+n_groups, left_rows_per_group, right_rows_per_group, do_join = (
+    int(x) for x in sys.argv[1:5]
+)
+
+left = pl.DataFrame(
+    {
+        "group": np.repeat(np.arange(n_groups), left_rows_per_group),
+        "time": np.tile(np.arange(left_rows_per_group), n_groups),
+    }
+).sort("group", "time")
+right = pl.DataFrame(
+    {
+        "group": np.repeat(np.arange(n_groups), right_rows_per_group),
+        "time": np.tile(np.arange(right_rows_per_group), n_groups),
+        "val": np.arange(n_groups * right_rows_per_group),
+    }
+).sort("group", "time")
+
+if do_join:
+    out = left.lazy().join_asof(right.lazy(), on="time", by="group").collect(
+        engine="streaming"
+    )
+    assert out.height == n_groups * left_rows_per_group
+
+# macOS reports bytes, Linux reports kibibytes.
+rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+print(rss if sys.platform == "darwin" else rss * 1024)
+"""
+
+    def peak_rss(n_groups: int, right_rows_per_group: int, do_join: bool) -> int:
+        n_runs = 3
+        # A single pipeline keeps the left input in one morsel, which is what
+        # makes the size of the right-side live range observable here.
+        env = {**os.environ, "POLARS_MAX_THREADS": "1"}
+        return min(
+            int(
+                subprocess.check_output(
+                    [
+                        sys.executable,
+                        "-c",
+                        script,
+                        str(n_groups),
+                        "4",
+                        str(right_rows_per_group),
+                        str(int(do_join)),
+                    ],
+                    env=env,
+                ).decode()
+            )
+            for _ in range(n_runs)
+        )
+
+    # The left morsel spans every group, so an unbounded right-side live range
+    # would be the whole right side.
+    n_groups = 1_000
+    right_rows_per_group = 2_000
+
+    build = peak_rss(n_groups, right_rows_per_group, do_join=False)
+    build_and_join = peak_rss(n_groups, right_rows_per_group, do_join=True)
+
+    join_extra = build_and_join - build
+
+    # Bounded by the morsel size the join adds a few MB on top of the ~48MB
+    # right side, rather than holding all of it in its live range.
+    assert join_extra < 30_000_000

@@ -22,7 +22,7 @@ use polars_utils::sort::reorder_cmp;
 use crate::DEFAULT_DISTRIBUTOR_BUFFER_SIZE;
 use crate::execute::StreamingExecutionState;
 use crate::graph::PortState;
-use crate::morsel::{Morsel, MorselSeq, SourceToken};
+use crate::morsel::{Morsel, MorselSeq, SourceToken, get_ideal_morsel_size};
 use crate::nodes::ComputeNode;
 use crate::nodes::joins::utils::{SpillFrameSearchBuffer, stop_and_take_pipe_contents};
 use crate::pipe::{PortReceiver, PortSender, RecvPort, SendPort};
@@ -322,49 +322,136 @@ async fn distribute_work_task(
             return Ok(());
         };
 
-        while need_more_right_side(&left_df, right_buffer, params).await? && !right_done {
-            if let Some(ref mut recv) = recv_right
-                && let Ok(morsel_right) = recv.recv().await
-            {
-                right_buffer.push_sf(morsel_right.into_sf()).await;
-            } else {
-                // The right pipe is empty at this stage, we will need to wait for
-                // a new stage and try again.
-                left_buffer.push_front(left_df);
-                for sf in stop_and_take_pipe_contents(recv_left.as_mut()).await {
-                    left_buffer.push_back(sf.into_df().await);
+        // Dispatch the left morsel in chunks aligned to `by`-group boundaries,
+        // so the right-side buffer only has to span the groups of one chunk.
+        // A chunk grows until the buffered live range reaches a morsel's worth
+        // of rows, at which point the groups it covers are dispatched.
+        let mut left_run_lengths = ScratchVec::default();
+        let group_ends = left_group_ends(&left_df, params, &mut left_run_lengths)?;
+        let left_height = left_df.height();
+        let mut chunk_start = 0usize;
+        // Index into `group_ends` of the first group that is not dispatched yet.
+        let mut first_group = 0usize;
+
+        while chunk_start < left_height {
+            let rest = left_df.slice(chunk_start as i64, left_height - chunk_start);
+
+            let chunk_end = loop {
+                if !need_more_right_side(&rest, right_buffer, params).await? {
+                    break left_height;
                 }
+                // Below a morsel's worth of buffered rows, growing the buffer is
+                // cheaper than splitting the work into more, smaller morsels.
+                if right_buffer.height() >= get_ideal_morsel_size()
+                    && let Some(end) =
+                        covered_group_end(&left_df, &group_ends, first_group, right_buffer, params)
+                            .await?
+                {
+                    break end;
+                }
+                if right_done {
+                    break left_height;
+                }
+                if let Some(ref mut recv) = recv_right
+                    && let Ok(morsel_right) = recv.recv().await
+                {
+                    right_buffer.push_sf(morsel_right.into_sf()).await;
+                } else {
+                    // The right pipe is empty at this stage, we will need to wait for
+                    // a new stage and try again.
+                    left_buffer
+                        .push_front(left_df.slice(chunk_start as i64, left_height - chunk_start));
+                    for sf in stop_and_take_pipe_contents(recv_left.as_mut()).await {
+                        left_buffer.push_back(sf.into_df().await);
+                    }
+                    return Ok(());
+                }
+            };
+
+            let chunk = left_df.slice(chunk_start as i64, chunk_end - chunk_start);
+
+            if params.as_of_options().check_sortedness {
+                check_left_continuity(last_non_null_row_left, &chunk, params)?;
+            }
+
+            if !params.as_of_options().check_sortedness {
+                // If we need to check sortedness, we cannot prune the right side
+                // yet, because the worker task still needs to check the internal
+                // sortedness of this right chunk.
+                prune_right_side(&chunk, right_buffer, 0, last_non_null_row_right, params).await?;
+            }
+            if distributor
+                .send((chunk.clone(), right_buffer.clone(), *output_seq, st.clone()))
+                .await
+                .is_err()
+            {
                 return Ok(());
             }
-        }
+            *output_seq = output_seq.successor();
+            prune_right_side(
+                &chunk,
+                right_buffer,
+                chunk.height().saturating_sub(1),
+                last_non_null_row_right,
+                params,
+            )
+            .await?;
 
-        if params.as_of_options().check_sortedness {
-            check_left_continuity(last_non_null_row_left, &left_df, params)?;
+            chunk_start = chunk_end;
+            while first_group < group_ends.len() && group_ends[first_group] <= chunk_start {
+                first_group += 1;
+            }
         }
-
-        if !params.as_of_options().check_sortedness {
-            // If we need to check sortedness, we cannot prune the right side
-            // yet, because the worker task still needs to check the internal
-            // sortedness of this right chunk.
-            prune_right_side(&left_df, right_buffer, 0, last_non_null_row_right, params).await?;
-        }
-        if distributor
-            .send((left_df.clone(), right_buffer.clone(), *output_seq, st))
-            .await
-            .is_err()
-        {
-            return Ok(());
-        }
-        *output_seq = output_seq.successor();
-        prune_right_side(
-            &left_df,
-            right_buffer,
-            left_df.height().saturating_sub(1),
-            last_non_null_row_right,
-            params,
-        )
-        .await?;
     }
+}
+
+/// The exclusive end offset of every `by`-group in `df`, in row order.
+///
+/// Without `by` columns the whole frame counts as a single group.
+fn left_group_ends(
+    df: &DataFrame,
+    params: &AsOfJoinParams,
+    run_lengths: &mut ScratchVec<IdxSize>,
+) -> PolarsResult<Vec<usize>> {
+    if params.left_by().is_empty() {
+        return Ok(vec![df.height()]);
+    }
+    let groups = ByGroups::find_groups(df, params.left_by(), run_lengths, params)?;
+    Ok(groups
+        .iter_groups()
+        .map(|(start, len)| start + len)
+        .collect())
+}
+
+/// The exclusive end offset of the last `by`-group in `group_ends[first_group..]`
+/// that `right` already covers, or `None` if it does not cover even the first
+/// one.
+///
+/// A group is covered when the right-side buffer holds everything any of its
+/// rows can match, so coverage is monotone over the (sorted) groups and the
+/// covered ones are exactly a prefix. That makes the boundary binary-searchable
+/// and lets a left morsel be dispatched in pieces without ever dropping a
+/// right-side row a later piece still needs.
+async fn covered_group_end(
+    left_df: &DataFrame,
+    group_ends: &[usize],
+    first_group: usize,
+    right: &SpillFrameSearchBuffer,
+    params: &AsOfJoinParams,
+) -> PolarsResult<Option<usize>> {
+    let mut lo = first_group;
+    let mut hi = group_ends.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        // The last row of a group decides whether that group is covered.
+        let probe = left_df.slice((group_ends[mid] - 1) as i64, 1);
+        if need_more_right_side(&probe, right, params).await? {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Ok((lo > first_group).then(|| group_ends[lo - 1]))
 }
 
 /// Check that the first row of the DataFrame is in order with respect to the value in prev_row.
