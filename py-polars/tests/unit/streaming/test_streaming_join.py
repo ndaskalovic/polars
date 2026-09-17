@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from polars._typing import AsofJoinStrategy, JoinStrategy, MaintainOrderJoin
+    from tests.conftest import PlMonkeyPatch
 
 pytestmark = pytest.mark.xdist_group("streaming")
 
@@ -841,3 +842,50 @@ print(rss if sys.platform == "darwin" else rss * 1024)
     # Bounded by the morsel size the join adds a few MB on top of the ~48MB
     # right side, rather than holding all of it in its live range.
     assert join_extra < 30_000_000
+
+
+@pytest.mark.parametrize("strategy", ["backward", "forward", "nearest"])
+@pytest.mark.parametrize("allow_exact_matches", [True, False])
+def test_streaming_asof_join_grouped_chunked_dispatch_28527(
+    strategy: AsofJoinStrategy,
+    allow_exact_matches: bool,
+    plmonkeypatch: PlMonkeyPatch,
+) -> None:
+    """Dispatching a left morsel in `by`-group aligned chunks must not change
+    the result.
+
+    The morsel size is forced small so that every morsel spans several chunks
+    and chunk boundaries land inside runs of equal keys.
+
+    https://github.com/pola-rs/polars/issues/28527
+    """
+    plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "4")
+
+    rng = np.random.default_rng(0)
+    n_groups, left_per_group, right_per_group = 50, 6, 9
+    # Duplicate keys within a group, so runs of equal keys straddle chunks.
+    left = pl.DataFrame(
+        {
+            "group": np.repeat(np.arange(n_groups), left_per_group),
+            "key": rng.integers(0, 12, n_groups * left_per_group),
+            "lval": np.arange(n_groups * left_per_group),
+        }
+    ).sort("group", "key")
+    right = pl.DataFrame(
+        {
+            "group": np.repeat(np.arange(n_groups), right_per_group),
+            "key": rng.integers(0, 12, n_groups * right_per_group),
+            "rval": np.arange(n_groups * right_per_group),
+        }
+    ).sort("group", "key")
+
+    q = left.lazy().join_asof(
+        right.lazy(),
+        on="key",
+        by="group",
+        strategy=strategy,
+        allow_exact_matches=allow_exact_matches,
+    )
+    expected = q.collect(engine="in-memory")
+    actual = q.collect(engine="streaming")
+    assert_frame_equal(actual, expected)
