@@ -324,15 +324,29 @@ async fn distribute_work_task(
         // so the right-side buffer only has to span the groups of one chunk.
         // A chunk grows until the buffered live range reaches a morsel's worth
         // of rows, at which point the groups it covers are dispatched.
-        let mut left_run_lengths = ScratchVec::default();
-        let group_ends = left_group_ends(&left_df, params, &mut left_run_lengths)?;
+        //
+        // Coverage is decided from the `by` and key values alone, so the probes
+        // below slice a key-only view of the morsel: slicing the whole frame
+        // rebuilds every column on each probe, which costs more the wider the
+        // left frame is and scales with the number of chunks.
+        let left_keys = left_df.select(
+            params
+                .left_by()
+                .iter()
+                .chain([params.left.key_col()])
+                .map(|c| c.as_str()),
+        )?;
         let left_height = left_df.height();
-        let mut chunk_start = 0usize;
-        // Index into `group_ends` of the first group that is not dispatched yet.
-        let mut first_group = 0usize;
 
+        // Only filled in once a chunk actually needs a group boundary. A morsel
+        // whose right side stays under the limit is never split, and the worker
+        // computes its own groups for each chunk it receives.
+        let mut left_run_lengths = ScratchVec::default();
+        let mut group_ends: Option<Vec<usize>> = None;
+
+        let mut chunk_start = 0usize;
         while chunk_start < left_height {
-            let rest = left_df.slice(chunk_start as i64, left_height - chunk_start);
+            let rest = left_keys.slice(chunk_start as i64, left_height - chunk_start);
 
             let chunk_end = loop {
                 if !need_more_right_side(&rest, right_buffer, params).await? {
@@ -340,12 +354,19 @@ async fn distribute_work_task(
                 }
                 // Below a morsel's worth of buffered rows, growing the buffer is
                 // cheaper than splitting the work into more, smaller morsels.
-                if right_buffer.height() >= get_ideal_morsel_size()
-                    && let Some(end) =
-                        covered_group_end(&left_df, &group_ends, first_group, right_buffer, params)
+                if right_buffer.height() >= get_ideal_morsel_size() {
+                    if group_ends.is_none() {
+                        group_ends =
+                            Some(left_group_ends(&left_keys, params, &mut left_run_lengths)?);
+                    }
+                    let ends = group_ends.as_ref().unwrap();
+                    let first_group = ends.partition_point(|&end| end <= chunk_start);
+                    if let Some(end) =
+                        covered_group_end(&left_keys, ends, first_group, right_buffer, params)
                             .await?
-                {
-                    break end;
+                    {
+                        break end;
+                    }
                 }
                 if right_done {
                     break left_height;
@@ -396,9 +417,6 @@ async fn distribute_work_task(
             .await?;
 
             chunk_start = chunk_end;
-            while first_group < group_ends.len() && group_ends[first_group] <= chunk_start {
-                first_group += 1;
-            }
         }
     }
 }
