@@ -375,6 +375,10 @@ async fn distribute_work_task(
                     && let Ok(morsel_right) = recv.recv().await
                 {
                     right_buffer.push_sf(morsel_right.into_sf()).await;
+                    // Bounds the buffer by the left frontier instead of letting
+                    // it grow until the next dispatch.
+                    prune_right_side(&rest, right_buffer, 0, true, last_non_null_row_right, params)
+                        .await?;
                 } else {
                     // The right pipe is empty at this stage, we will need to wait for
                     // a new stage and try again.
@@ -397,7 +401,8 @@ async fn distribute_work_task(
                 // If we need to check sortedness, we cannot prune the right side
                 // yet, because the worker task still needs to check the internal
                 // sortedness of this right chunk.
-                prune_right_side(&chunk, right_buffer, 0, last_non_null_row_right, params).await?;
+                prune_right_side(&chunk, right_buffer, 0, false, last_non_null_row_right, params)
+                    .await?;
             }
             if distributor
                 .send((chunk.clone(), right_buffer.clone(), *output_seq, st.clone()))
@@ -411,6 +416,7 @@ async fn distribute_work_task(
                 &chunk,
                 right_buffer,
                 chunk.height().saturating_sub(1),
+                false,
                 last_non_null_row_right,
                 params,
             )
@@ -506,6 +512,7 @@ async fn check_right_continuity(
     last_non_null_row: &mut Option<DataFrame>,
     dfsb: &SpillFrameSearchBuffer,
     split_at_idx: usize,
+    validate_dropped: bool,
     params: &AsOfJoinParams,
 ) -> PolarsResult<()> {
     let key_col_name = params.right.key_col();
@@ -519,6 +526,27 @@ async fn check_right_continuity(
         .select(sorted_by_cols.clone())?;
     let before_split = df.slice(0, split_at_idx);
     let after_split = df.slice(split_at_idx as i64, df.height() - split_at_idx);
+
+    // Nothing else validates rows this prune drops, so check the prefix here -
+    // sorted internally, and in order with the prefix dropped before it.
+    if validate_dropped && before_split.height() > 0 {
+        if !before_split.is_sorted(
+            &sorted_by_cols.clone().cloned().collect_vec(),
+            &sorted_by_descending.clone().cloned().collect_vec(),
+            &sorted_by_nulls_last.clone().cloned().collect_vec(),
+        )? {
+            return Err(not_sorted_err());
+        }
+        let first_non_null = before_split.column(key_col_name)?.first_non_null();
+        check_continuity(
+            last_non_null_row.clone(),
+            first_non_null.map(|pos| before_split.slice(pos as i64, 1)),
+            sorted_by_cols.clone(),
+            sorted_by_descending.clone(),
+            sorted_by_nulls_last.clone(),
+        )?;
+    }
+
     let last_non_null = before_split.column(key_col_name)?.last_non_null();
     let first_non_null = after_split.column(key_col_name)?.first_non_null();
     let before_split_point_row = last_non_null
@@ -648,10 +676,13 @@ async fn need_more_right_side(
 
 /// Prune right-side rows that are no longer needed using a specific left row as the
 /// pruning reference point.
+///
+/// `validate_dropped` is set when the caller drops rows no worker will see.
 async fn prune_right_side(
     left: &DataFrame,
     right: &mut SpillFrameSearchBuffer,
     left_row_idx: usize,
+    validate_dropped: bool,
     last_non_null_row: &mut Option<DataFrame>,
     params: &AsOfJoinParams,
 ) -> PolarsResult<()> {
@@ -688,7 +719,14 @@ async fn prune_right_side(
     }
 
     if params.as_of_options().check_sortedness {
-        check_right_continuity(last_non_null_row, right, right_range_start, params).await?;
+        check_right_continuity(
+            last_non_null_row,
+            right,
+            right_range_start,
+            validate_dropped,
+            params,
+        )
+        .await?;
     }
     right.split_at(right_range_start);
     Ok(())

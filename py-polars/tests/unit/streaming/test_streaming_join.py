@@ -889,3 +889,26 @@ def test_streaming_asof_join_grouped_chunked_dispatch_28527(
     expected = q.collect(engine="in-memory")
     actual = q.collect(engine="streaming")
     assert_frame_equal(actual, expected)
+
+
+def test_streaming_asof_join_unsorted_seam_between_pruned_buffers_28527(
+    plmonkeypatch: PlMonkeyPatch,
+) -> None:
+    """An unsortedness falling between two dropped right buffers must still raise.
+
+    Sortedness is validated window by window, so a prune that drops a whole
+    buffer has to vouch for those rows itself - including the seam joining them
+    to the buffer dropped before them. `forward` never keeps a row back, so with
+    a small morsel every pull drops the entire buffer and the seam is the only
+    place the unsortedness shows.
+
+    https://github.com/pola-rs/polars/issues/28527
+    """
+    plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "2")
+
+    for keys in ([2, 0, 1, 1, 2, 4], [1, 0], [3, 4, 2, 0, 4, 6]):
+        right = pl.DataFrame({"ts": keys})
+        left = pl.DataFrame({"ts": [max(keys) + 1]})
+        q = left.lazy().join_asof(right.lazy(), on="ts", strategy="forward")
+        with pytest.raises(pl.exceptions.InvalidOperationError):
+            q.collect(engine="streaming")
