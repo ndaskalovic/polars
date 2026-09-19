@@ -718,6 +718,12 @@ async fn prune_right_side(
         right_range_start = right_range_start.saturating_sub(1).max(start);
     }
 
+    // Nothing to drop, and `check_right_continuity` would materialise the whole
+    // buffer to validate an empty prefix.
+    if right_range_start == 0 {
+        return Ok(());
+    }
+
     if params.as_of_options().check_sortedness {
         check_right_continuity(
             last_non_null_row,
