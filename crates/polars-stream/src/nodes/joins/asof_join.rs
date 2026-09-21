@@ -9,7 +9,7 @@ use polars_core::prelude::row_encode::_get_rows_encoded_ca;
 use polars_core::prelude::*;
 use polars_core::utils::{Container, accumulate_dataframes_vertical_unchecked};
 use polars_defs::join::{AsOfOptions, AsofStrategy, JoinArgs, JoinType};
-use polars_ooc::RandomSpillContext;
+use polars_ooc::{RandomSpillContext, SpillFrame};
 use polars_ops::frame::is_sorted::DataFrameIsSorted;
 use polars_ops::frame::{_check_asof_columns, _finish_join, _join_asof_dispatch};
 use polars_ops::series::{rle_lengths, rle_lengths_helper_ca};
@@ -94,6 +94,9 @@ pub struct AsOfJoinNode {
     // Used to check that each side is sorted across morsel boundaries.
     last_non_null_row_left: Option<DataFrame>,
     last_non_null_row_right: Option<DataFrame>,
+    /// Last row of the previous right-side frame, used to check that consecutive
+    /// right frames are in order with each other as they are buffered.
+    last_row_right: Option<DataFrame>,
 }
 
 impl AsOfJoinNode {
@@ -156,6 +159,7 @@ impl AsOfJoinNode {
             output_seq: Default::default(),
             last_non_null_row_left: None,
             last_non_null_row_right: None,
+            last_row_right: None,
         }
     }
 }
@@ -252,6 +256,7 @@ impl ComputeNode for AsOfJoinNode {
                 let output_seq = &mut self.output_seq;
                 let last_non_null_row_left = &mut self.last_non_null_row_left;
                 let last_non_null_row_right = &mut self.last_non_null_row_right;
+                let last_row_right = &mut self.last_row_right;
                 join_handles.push(scope.spawn_task(TaskPriority::High, async move {
                     distribute_work_task(
                         recv_left,
@@ -262,6 +267,7 @@ impl ComputeNode for AsOfJoinNode {
                         output_seq,
                         last_non_null_row_left,
                         last_non_null_row_right,
+                        last_row_right,
                         params,
                     )
                     .await
@@ -290,12 +296,16 @@ async fn distribute_work_task(
     output_seq: &mut MorselSeq,
     last_non_null_row_left: &mut Option<DataFrame>,
     last_non_null_row_right: &mut Option<DataFrame>,
+    last_row_right: &mut Option<DataFrame>,
     params: &AsOfJoinParams,
 ) -> PolarsResult<()> {
     let source_token = SourceToken::new();
     let right_done = recv_right.is_none();
 
     loop {
+        // The right pipe is only drained into the buffer on the two paths that
+        // return immediately below, and no dispatch can follow either of them,
+        // so those rows never need the check `push_right_frame` performs.
         if source_token.stop_requested() {
             for sf in stop_and_take_pipe_contents(recv_left.as_mut()).await {
                 left_buffer.push_back(sf.into_df().await);
@@ -374,10 +384,11 @@ async fn distribute_work_task(
                 if let Some(ref mut recv) = recv_right
                     && let Ok(morsel_right) = recv.recv().await
                 {
-                    right_buffer.push_sf(morsel_right.into_sf()).await;
+                    push_right_frame(right_buffer, morsel_right.into_sf(), last_row_right, params)
+                        .await?;
                     // Bounds the buffer by the left frontier instead of letting
                     // it grow until the next dispatch.
-                    prune_right_side(&rest, right_buffer, 0, true, last_non_null_row_right, params)
+                    prune_right_side(&rest, right_buffer, 0, last_non_null_row_right, params)
                         .await?;
                 } else {
                     // The right pipe is empty at this stage, we will need to wait for
@@ -401,8 +412,7 @@ async fn distribute_work_task(
                 // If we need to check sortedness, we cannot prune the right side
                 // yet, because the worker task still needs to check the internal
                 // sortedness of this right chunk.
-                prune_right_side(&chunk, right_buffer, 0, false, last_non_null_row_right, params)
-                    .await?;
+                prune_right_side(&chunk, right_buffer, 0, last_non_null_row_right, params).await?;
             }
             if distributor
                 .send((chunk.clone(), right_buffer.clone(), *output_seq, st.clone()))
@@ -416,7 +426,6 @@ async fn distribute_work_task(
                 &chunk,
                 right_buffer,
                 chunk.height().saturating_sub(1),
-                false,
                 last_non_null_row_right,
                 params,
             )
@@ -512,7 +521,6 @@ async fn check_right_continuity(
     last_non_null_row: &mut Option<DataFrame>,
     dfsb: &SpillFrameSearchBuffer,
     split_at_idx: usize,
-    validate_dropped: bool,
     params: &AsOfJoinParams,
 ) -> PolarsResult<()> {
     let key_col_name = params.right.key_col();
@@ -526,26 +534,6 @@ async fn check_right_continuity(
         .select(sorted_by_cols.clone())?;
     let before_split = df.slice(0, split_at_idx);
     let after_split = df.slice(split_at_idx as i64, df.height() - split_at_idx);
-
-    // Nothing else validates rows this prune drops, so check the prefix here -
-    // sorted internally, and in order with the prefix dropped before it.
-    if validate_dropped && before_split.height() > 0 {
-        if !before_split.is_sorted(
-            &sorted_by_cols.clone().cloned().collect_vec(),
-            &sorted_by_descending.clone().cloned().collect_vec(),
-            &sorted_by_nulls_last.clone().cloned().collect_vec(),
-        )? {
-            return Err(not_sorted_err());
-        }
-        let first_non_null = before_split.column(key_col_name)?.first_non_null();
-        check_continuity(
-            last_non_null_row.clone(),
-            first_non_null.map(|pos| before_split.slice(pos as i64, 1)),
-            sorted_by_cols.clone(),
-            sorted_by_descending.clone(),
-            sorted_by_nulls_last.clone(),
-        )?;
-    }
 
     let last_non_null = before_split.column(key_col_name)?.last_non_null();
     let first_non_null = after_split.column(key_col_name)?.first_non_null();
@@ -674,15 +662,54 @@ async fn need_more_right_side(
     Ok(right_range_end >= right.height())
 }
 
+/// Check that a right-side frame is in order with the one before it, then add it
+/// to the buffer.
+///
+/// The prune drops a prefix no worker will see, so those rows have to be checked
+/// here. One frame at a time is enough: the buffer stays a contiguous run of
+/// checked frames, and any part cut out of it is therefore in order.
+///
+/// Do not move this onto the buffer: `vstack` gives an all-null tail the
+/// ascending flag, which makes `is_sorted` on the stacked buffer vacuous.
+async fn push_right_frame(
+    buffer: &mut SpillFrameSearchBuffer,
+    sf: SpillFrame,
+    last_row: &mut Option<DataFrame>,
+    params: &AsOfJoinParams,
+) -> PolarsResult<()> {
+    if params.as_of_options().check_sortedness {
+        let sorted_by_cols = params.right_by().iter().chain([params.right.key_col()]);
+        let new_last_row = {
+            let df = sf.get().await;
+            if df.height() == 0 {
+                None
+            } else {
+                let project = df.select(sorted_by_cols.clone().map(|c| c.as_str()))?;
+                check_df_sorted(&project, params.right_by(), params.right.key_col(), params)?;
+                check_continuity(
+                    last_row.clone(),
+                    Some(project.slice(0, 1)),
+                    sorted_by_cols.clone(),
+                    params.by_descending.iter().chain([&false]),
+                    params.by_nulls_last.iter().chain([&false]),
+                )?;
+                Some(project.slice(project.height() as i64 - 1, 1))
+            }
+        };
+        if new_last_row.is_some() {
+            *last_row = new_last_row;
+        }
+    }
+    buffer.push_sf(sf).await;
+    Ok(())
+}
+
 /// Prune right-side rows that are no longer needed using a specific left row as the
 /// pruning reference point.
-///
-/// `validate_dropped` is set when the caller drops rows no worker will see.
 async fn prune_right_side(
     left: &DataFrame,
     right: &mut SpillFrameSearchBuffer,
     left_row_idx: usize,
-    validate_dropped: bool,
     last_non_null_row: &mut Option<DataFrame>,
     params: &AsOfJoinParams,
 ) -> PolarsResult<()> {
@@ -725,14 +752,7 @@ async fn prune_right_side(
     }
 
     if params.as_of_options().check_sortedness {
-        check_right_continuity(
-            last_non_null_row,
-            right,
-            right_range_start,
-            validate_dropped,
-            params,
-        )
-        .await?;
+        check_right_continuity(last_non_null_row, right, right_range_start, params).await?;
     }
     right.split_at(right_range_start);
     Ok(())

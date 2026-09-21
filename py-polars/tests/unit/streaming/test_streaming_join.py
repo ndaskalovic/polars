@@ -912,3 +912,56 @@ def test_streaming_asof_join_unsorted_seam_between_pruned_buffers_28527(
         q = left.lazy().join_asof(right.lazy(), on="ts", strategy="forward")
         with pytest.raises(pl.exceptions.InvalidOperationError):
             q.collect(engine="streaming")
+
+
+def test_streaming_asof_join_unsorted_null_seam_between_pruned_buffers_28527(
+    plmonkeypatch: PlMonkeyPatch,
+) -> None:
+    """An inversion involving a null at a right-side frame boundary must raise.
+
+    Keys order nulls first, so both a null following a non-null and a non-null
+    following a null are inversions. Comparing the raw boundary rows catches
+    both; selecting rows by first/last non-null steps over the only row that
+    witnesses it.
+
+    https://github.com/pola-rs/polars/issues/28527
+    """
+    plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "2")
+
+    for keys, strategy in (
+        ([1, 1, None, 2], "forward"),
+        ([1, None, 2, 2], "backward"),
+        ([1, None, 2, 2], "nearest"),
+    ):
+        right = pl.DataFrame({"ts": keys})
+        left = pl.DataFrame({"ts": [max(k for k in keys if k is not None) + 1]})
+        assert not right.is_sorted(by=["ts"], nulls_last=False)
+        q = left.lazy().join_asof(right.lazy(), on="ts", strategy=strategy)
+        with pytest.raises(pl.exceptions.InvalidOperationError):
+            q.collect(engine="streaming")
+
+
+def test_streaming_asof_join_unsorted_null_tail_28527(
+    plmonkeypatch: PlMonkeyPatch,
+) -> None:
+    """A right side ending in nulls must be rejected.
+
+    The prune drops rows no worker will ever see, so it has to vouch for them.
+    The buffer is assembled with `vstack`, and `vstack` hands a concatenation
+    whose tail is all-null the ascending flag - so `is_sorted(..., nulls_last=False)`
+    returns true for those rows whatever they hold. Checking each right frame as
+    it arrives, before it is stacked, is what the buffer's order rests on.
+
+    https://github.com/pola-rs/polars/issues/28527
+    """
+    plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "1")
+
+    right = pl.DataFrame({"ts": [0, 1, None, None, 0]})
+    assert not right.is_sorted(by=["ts"], nulls_last=False)
+    left = pl.DataFrame({"ts": [0]})
+
+    q = left.lazy().join_asof(
+        right.lazy(), on="ts", strategy="nearest", allow_exact_matches=False
+    )
+    with pytest.raises(pl.exceptions.InvalidOperationError):
+        q.collect(engine="streaming")
