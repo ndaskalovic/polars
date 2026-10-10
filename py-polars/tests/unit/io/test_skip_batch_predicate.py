@@ -307,3 +307,30 @@ def test_float_skip_batch_predicate() -> None:
     )  # Can skip. Non-NaN bounds.
     assert sbp(pl.col("x").is_between(NaN, 4.0)) is None  # No skip. NaN left bound.
     assert sbp(pl.col("x").is_between(1.0, NaN)) is None  # No skip. NaN right bound.
+
+
+def test_is_in_skip_batch_predicate_is_exact_for_large_haystacks() -> None:
+    """A haystack above the unrolled limit tests needles, not the haystack's hull.
+
+    Needles 0..74 and 100..149: a batch on [75, 99] sits inside the hull
+    [0, 149] but holds no needle, and must still be skippable.
+    """
+    dtype = pl.Int64()
+    needles = [*range(75), *range(100, 150)]  # 125 needles, hull [0, 149]
+
+    assert_skp_series(
+        "x",
+        dtype,
+        pl.col("x").is_in(needles),
+        [
+            {"min": 0, "max": 74, "null_count": 0, "len": 10, "can_skip": False},
+            {"min": 75, "max": 99, "null_count": 0, "len": 10, "can_skip": True},
+            {"min": 100, "max": 149, "null_count": 0, "len": 10, "can_skip": False},
+            {"min": 74, "max": 100, "null_count": 0, "len": 10, "can_skip": False},
+            {"min": 150, "max": 199, "null_count": 0, "len": 10, "can_skip": True},
+            # Undefined statistics settle nothing.
+            {"min": None, "max": None, "null_count": 0, "len": 10, "can_skip": False},
+            # Every row null, and the haystack holds no null: nothing matches.
+            {"min": None, "max": None, "null_count": 10, "len": 10, "can_skip": True},
+        ],
+    )

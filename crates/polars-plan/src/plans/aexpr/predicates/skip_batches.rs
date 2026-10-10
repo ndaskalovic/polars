@@ -510,8 +510,6 @@ fn aexpr_to_skip_batch_predicate_rec(
                             constant_evaluate(lv_node, arena, schema, 0),
                         ) {
                             (Some(target), Some(_)) => {
-                                use polars_core::prelude::ExplodeOptions;
-
                                 let dtype = target_leaf_dtype(&target, schema)?;
                                 if !can_use_min_max_stats(dtype, None, None) {
                                     return None;
@@ -526,35 +524,15 @@ fn aexpr_to_skip_batch_predicate_rec(
                                 // col(A).is_in([B1, ..., Bn]) -> {
                                 //     min(A) == max(A) && null_count(A) == 0 && !min(A).is_in(lv),
                                 //     (!lv.has_nulls() || null_count(A) == 0) &&
-                                //         (null_count(A) == LEN ||
-                                //             AND_i (min(A) > Bi || max(A) < Bi)) , if N <= LIMIT,
-                                //         (null_count(A) == LEN ||
-                                //             min(A) > max(lv) || max(A) < min(lv)) , otherwise,
+                                //         (null_count(A) == LEN || no needle in [min(A), max(A)]),
                                 // }
+                                // No needle in `[min, max]` iff the insertion point of `min` (the
+                                // first needle >= min) equals that of `max` (the first needle > max).
                                 // Branch 1 mirrors the generic min==max fallback for const-col rgs.
-                                // `min(A) > X` / `max(A) < X` elide an `is_defined(stat) &&` guard.
                                 // Helper drops haystack nulls; the `(!lv.has_nulls() || null_count(A)
-                                // == 0)` gate is applied only when needed: per-case under
-                                // nulls_equal=true in the unrolled path (when a null was dropped),
-                                // and conditionally in the fallback path.
-                                const LIST_ITEM_LIMIT: usize = 100;
-
-                                let values = try_extract_is_in_haystack(
-                                    lv_node,
-                                    arena,
-                                    schema,
-                                    dtype,
-                                    LIST_ITEM_LIMIT,
-                                );
-
+                                // == 0)` gate is applied only when needed: under nulls_equal=true when
+                                // a null was dropped.
                                 let lv_node = lv_node.into_aexpr_builder();
-                                let lv_node_exploded = lv_node.explode(
-                                    arena,
-                                    ExplodeOptions {
-                                        empty_as_null: false,
-                                        keep_nulls: true,
-                                    },
-                                );
 
                                 let col_min = target.min(arena);
                                 let col_max = target.max(arena);
@@ -571,28 +549,18 @@ fn aexpr_to_skip_batch_predicate_rec(
                                 let all_nulls = col_nc.eq(len, arena);
                                 let col_has_no_nulls = col_nc.eq(idx_zero, arena);
 
-                                let min_max_not_in = if let Some((values, had_nulls)) = values {
-                                    // Per-element AND. Empty list folds to `true` (AND identity);
-                                    // `is_in([])` is unconditionally false. The helper has dropped
-                                    // any haystack nulls; the per-case `null_count(A) == 0` guard
-                                    // below handles the column-has-nulls × haystack-has-null
-                                    // interaction under nulls_equal=true.
-                                    let inner = values.iter().fold(lv!(true), |acc, av| {
-                                        let scalar = Scalar::new(dtype.clone(), av.into_static());
-                                        let bi = AExprBuilder::lit_scalar(scalar, arena);
-                                        let below =
-                                            min_is_defined.and(col_min.gt(bi, arena), arena);
-                                        let above =
-                                            max_is_defined.and(col_max.lt(bi, arena), arena);
-                                        acc.and(below.or(above, arena), arena)
-                                    });
-                                    let expr = all_nulls.or(inner, arena);
-                                    if had_nulls && nulls_equal {
-                                        expr.and(col_has_no_nulls, arena)
-                                    } else {
-                                        expr
-                                    }
-                                } else {
+                                // Hull of the haystack, for a haystack the helper cannot read as a
+                                // constant list.
+                                let hull_not_in = |arena: &mut Arena<AExpr>| {
+                                    use polars_core::prelude::ExplodeOptions;
+
+                                    let lv_node_exploded = lv_node.explode(
+                                        arena,
+                                        ExplodeOptions {
+                                            empty_as_null: false,
+                                            keep_nulls: true,
+                                        },
+                                    );
                                     let lv_min = lv_node_exploded.min(arena);
                                     let lv_max = lv_node_exploded.max(arena);
                                     let below =
@@ -603,12 +571,112 @@ fn aexpr_to_skip_batch_predicate_rec(
                                     let expr = all_nulls.or(inner, arena);
 
                                     if nulls_equal {
-                                        let lv_has_not_nulls = lv_node_exploded.has_no_nulls(arena);
+                                        let lv_has_not_nulls =
+                                            lv_node_exploded.has_no_nulls(arena);
                                         let null_case =
                                             lv_has_not_nulls.or(col_has_no_nulls, arena);
                                         null_case.and(expr, arena)
                                     } else {
                                         expr
+                                    }
+                                };
+
+                                #[cfg(feature = "search_sorted")]
+                                let min_max_not_in = {
+                                    use polars_core::chunked_array::ops::search_sorted::SearchSortedSide;
+                                    use polars_core::prelude::SortOptions;
+
+                                    use crate::prelude::SpecialEq;
+
+                                    match try_extract_is_in_haystack(
+                                        lv_node.node(),
+                                        arena,
+                                        schema,
+                                        dtype,
+                                        usize::MAX,
+                                    ) {
+                                        // `is_in([])` is false for every row.
+                                        Some((values, _)) if values.is_empty() => lv!(true),
+                                        Some((values, had_nulls)) => {
+                                            let needles = AExprBuilder::lit(
+                                                LiteralValue::Series(SpecialEq::new(
+                                                    values.sort(SortOptions::default()).ok()?,
+                                                )),
+                                                arena,
+                                            );
+                                            let search = |value: AExprBuilder,
+                                                          side: SearchSortedSide,
+                                                          arena: &mut Arena<AExpr>| {
+                                                AExprBuilder::function(
+                                                    vec![
+                                                        ExprIR::from_node(needles.node(), arena),
+                                                        ExprIR::from_node(value.node(), arena),
+                                                    ],
+                                                    IRFunctionExpr::SearchSorted {
+                                                        side,
+                                                        descending: false,
+                                                    },
+                                                    arena,
+                                                )
+                                            };
+                                            let first_ge_min =
+                                                search(col_min, SearchSortedSide::Left, arena);
+                                            let first_gt_max =
+                                                search(col_max, SearchSortedSide::Right, arena);
+                                            let range_is_empty =
+                                                first_ge_min.eq(first_gt_max, arena);
+
+                                            let inner = min_is_defined
+                                                .and(max_is_defined, arena)
+                                                .and(range_is_empty, arena);
+                                            let expr = all_nulls.or(inner, arena);
+                                            if had_nulls && nulls_equal {
+                                                expr.and(col_has_no_nulls, arena)
+                                            } else {
+                                                expr
+                                            }
+                                        },
+                                        None => hull_not_in(arena),
+                                    }
+                                };
+
+                                // Without search_sorted: unroll the needles, capped at
+                                // LIST_ITEM_LIMIT.
+                                #[cfg(not(feature = "search_sorted"))]
+                                let min_max_not_in = {
+                                    const LIST_ITEM_LIMIT: usize = 100;
+
+                                    match try_extract_is_in_haystack(
+                                        lv_node.node(),
+                                        arena,
+                                        schema,
+                                        dtype,
+                                        LIST_ITEM_LIMIT,
+                                    ) {
+                                        Some((values, had_nulls)) => {
+                                            // Per-element AND.
+                                            let inner =
+                                                values.iter().fold(lv!(true), |acc, av| {
+                                                    let scalar = Scalar::new(
+                                                        dtype.clone(),
+                                                        av.into_static(),
+                                                    );
+                                                    let bi =
+                                                        AExprBuilder::lit_scalar(scalar, arena);
+                                                    let below = min_is_defined
+                                                        .and(col_min.gt(bi, arena), arena);
+                                                    let above = max_is_defined
+                                                        .and(col_max.lt(bi, arena), arena);
+                                                    acc.and(below.or(above, arena), arena)
+                                                });
+                                            let expr = all_nulls.or(inner, arena);
+                                            if had_nulls && nulls_equal {
+                                                expr.and(col_has_no_nulls, arena)
+                                            } else {
+                                                expr
+                                            }
+                                        },
+                                        None => hull_not_in(arena),
                                     }
                                 };
 
