@@ -332,7 +332,11 @@ async fn distribute_work_task(
         };
 
         let mut start_settled = false;
-        while need_more_right_side(&left_df, right_buffer, params).await? && !right_done {
+        while right_range_end(&left_df, right_buffer, params)
+            .await?
+            .is_none()
+            && !right_done
+        {
             // Once the buffer holds a morsel's worth of rows, send the leading left rows whose
             // matches have all arrived, so the buffer need not span all of the morsel's.
             if right_buffer.height() >= ideal_morsel_size {
@@ -378,24 +382,36 @@ async fn distribute_work_task(
             check_left_continuity(last_non_null_row_left, &left_df, params)?;
         }
 
-        prune_right_side(
-            &left_df,
-            right_buffer,
-            0,
-            last_non_null_row_right,
-            right_rows_sent,
-            params,
-        )
-        .await?;
+        if !params.as_of_options().check_sortedness {
+            // With sortedness checks the rows are sent instead, so a worker checks them, not
+            // this task, and the prune after sending drops them.
+            prune_right_side(
+                &left_df,
+                right_buffer,
+                0,
+                last_non_null_row_right,
+                right_rows_sent,
+                params,
+            )
+            .await?;
+        }
+        // Send only the right rows the morsel can match: all of them once no more arrive.
+        let end = right_range_end(&left_df, right_buffer, params).await?;
+        let end = end.unwrap_or(right_buffer.height());
         if distributor
-            .send((left_df.clone(), right_buffer.clone(), *output_seq, st))
+            .send((
+                left_df.clone(),
+                right_buffer.clone().slice(0, end),
+                *output_seq,
+                st,
+            ))
             .await
             .is_err()
         {
             return Ok(());
         }
         *output_seq = output_seq.successor();
-        *right_rows_sent = right_buffer.height();
+        *right_rows_sent = (*right_rows_sent).max(end);
         prune_right_side(
             &left_df,
             right_buffer,
@@ -418,7 +434,10 @@ async fn covered_len(
     let (mut lo, mut hi) = (0, left.height() - 1);
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
-        if need_more_right_side(&left.slice(0, mid), right, params).await? {
+        if right_range_end(&left.slice(0, mid), right, params)
+            .await?
+            .is_none()
+        {
             hi = mid - 1;
         } else {
             lo = mid;
@@ -527,19 +546,19 @@ where
     Ok(())
 }
 
-/// Do we need more values on the right side before we can compute the AsOf join
-/// between the right side and the complete left side?
-async fn need_more_right_side(
+/// The end of the right rows `left` can match, or `None` if more right rows are needed to
+/// know it.
+async fn right_range_end(
     left: &DataFrame,
     right: &SpillFrameSearchBuffer,
     params: &AsOfJoinParams,
-) -> PolarsResult<bool> {
+) -> PolarsResult<Option<usize>> {
     // Rows with a null key match nothing, so the last other row needs the most right rows.
     let Some(last) = left.column(params.left.key_col())?.last_non_null() else {
-        return Ok(false);
+        return Ok(Some(0));
     };
     if right.height() == 0 {
-        return Ok(true);
+        return Ok(None);
     }
 
     let options = params.as_of_options();
@@ -561,16 +580,16 @@ async fn need_more_right_side(
             .binary_search(|x| cmp(x, &left_last_group).is_gt(), right_by, start..end)
             .await;
         if start >= right.height() {
-            return Ok(true);
+            return Ok(None);
         } else if end < right.height() {
-            return Ok(false);
+            return Ok(Some(end));
         }
     }
 
     let left_key = left.column(params.left.key_col())?.as_materialized_series();
     // SAFETY: `last` is in bounds.
     let left_last_val = unsafe { left_key.get_unchecked(last) };
-    let right_range_end = match (options.strategy, options.allow_eq) {
+    let match_end = match (options.strategy, options.allow_eq) {
         (Forward, true) | (Backward, false) => {
             right
                 .binary_search(|x| *x >= left_last_val, params.right.key_col(), start..end)
@@ -586,7 +605,7 @@ async fn need_more_right_side(
                 .binary_search(|x| *x > left_last_val, params.right.key_col(), start..end)
                 .await;
             if first_greater >= right.height() {
-                return Ok(true);
+                return Ok(None);
             }
             // In the Nearest case, there may be a chunk of consecutive equal
             // values following the match value on the left side.  In this case,
@@ -607,7 +626,11 @@ async fn need_more_right_side(
                 .await
         },
     };
-    Ok(right_range_end >= right.height())
+    if match_end >= right.height() {
+        return Ok(None);
+    }
+    // A forward match is the row found itself.
+    Ok(Some(match_end + usize::from(options.strategy == Forward)))
 }
 
 /// Prune right-side rows that are no longer needed using a specific left row as the
