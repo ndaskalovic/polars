@@ -331,16 +331,12 @@ async fn distribute_work_task(
             return Ok(());
         };
 
-        let mut group_ends = Vec::new();
         let mut start_settled = false;
         while need_more_right_side(&left_df, right_buffer, params).await? && !right_done {
-            // Once the buffer holds a morsel's worth of rows, send the leading left groups whose
-            // matches have all arrived, so the buffer need not span every group of the morsel.
-            if right_buffer.height() >= ideal_morsel_size && !params.left_by().is_empty() {
-                if group_ends.is_empty() {
-                    group_ends = left_group_ends(&left_df, params)?;
-                }
-                let len = covered_len(&left_df, &group_ends, right_buffer, params).await?;
+            // Once the buffer holds a morsel's worth of rows, send the leading left rows whose
+            // matches have all arrived, so the buffer need not span all of the morsel's.
+            if right_buffer.height() >= ideal_morsel_size {
+                let len = covered_len(&left_df, right_buffer, params).await?;
                 if len > 0 {
                     let rest;
                     (left_df, rest) = left_df.split_at(len as i64);
@@ -412,35 +408,23 @@ async fn distribute_work_task(
     }
 }
 
-/// The end of each `by` group of `left`.
-fn left_group_ends(left: &DataFrame, params: &AsOfJoinParams) -> PolarsResult<Vec<usize>> {
-    let mut lengths = ScratchVec::default();
-    let groups = ByGroups::find_groups(left, params.left_by(), &mut lengths, params)?;
-    Ok(groups
-        .iter_groups()
-        .map(|(start, len)| start + len)
-        .collect())
-}
-
-/// The length of the longest prefix of whole `by` groups of `left` (ending at `ends`) whose
-/// matches have all arrived in `right`.
+/// The length of the longest prefix of `left` whose matches have all arrived in `right`.
 async fn covered_len(
     left: &DataFrame,
-    ends: &[usize],
     right: &SpillFrameSearchBuffer,
     params: &AsOfJoinParams,
 ) -> PolarsResult<usize> {
     // Needing more right rows is monotone in the prefix, and all of `left` needs more.
-    let (mut lo, mut hi) = (0, ends.len() - 1);
+    let (mut lo, mut hi) = (0, left.height() - 1);
     while lo < hi {
-        let mid = (lo + hi) / 2;
-        if need_more_right_side(&left.slice(0, ends[mid]), right, params).await? {
-            hi = mid;
+        let mid = lo + (hi - lo).div_ceil(2);
+        if need_more_right_side(&left.slice(0, mid), right, params).await? {
+            hi = mid - 1;
         } else {
-            lo = mid + 1;
+            lo = mid;
         }
     }
-    Ok(lo.checked_sub(1).map_or(0, |i| ends[i]))
+    Ok(lo)
 }
 
 /// Check that the first row of the DataFrame is in order with respect to the value in prev_row.

@@ -1092,11 +1092,11 @@ def test_streaming_join_keeps_height_of_input_without_columns(
 
 
 @pytest.mark.parametrize("strategy", ["backward", "forward", "nearest"])
-@pytest.mark.parametrize("by", [["g"], ["g", "h"]])
-def test_streaming_asof_join_groups_sent_apart_28527(
+@pytest.mark.parametrize("by", [[], ["g"], ["g", "h"]])
+def test_streaming_asof_join_sent_in_pieces_28527(
     strategy: AsofJoinStrategy, by: list[str], plmonkeypatch: PlMonkeyPatch
 ) -> None:
-    # Enough right rows per left morsel for its leading groups to be sent on their own.
+    # Enough right rows per left morsel for its leading rows to be sent on their own.
     plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "100")
     rng = np.random.default_rng(0)
 
@@ -1111,7 +1111,7 @@ def test_streaming_asof_join_groups_sent_apart_28527(
     q = (
         frame(1_000)
         .lazy()
-        .join_asof(frame(20_000).lazy(), on="t", by=by, strategy=strategy)
+        .join_asof(frame(20_000).lazy(), on="t", by=by or None, strategy=strategy)
     )
     assert_frame_equal(q.collect(engine="streaming"), q.collect(engine="in-memory"))
 
