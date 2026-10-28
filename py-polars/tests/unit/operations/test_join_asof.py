@@ -1486,6 +1486,32 @@ def test_join_asof_not_sorted_streaming_grouped_27457(
             lf.join_asof(lf2, on="a", by="group").collect(engine="streaming")
 
 
+@pytest.mark.parametrize("keys", [[2, 0, 1, 2, 4], [3, 4, 2, 0, 4, 6]])
+def test_join_asof_not_sorted_streaming_pruned_28527(
+    keys: list[int], plmonkeypatch: PlMonkeyPatch
+) -> None:
+    # Right rows pruned before any worker sees them are checked too.
+    plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "1")
+    q = pl.LazyFrame({"t": [9]}).join_asof(
+        pl.LazyFrame({"t": keys}), on="t", strategy="forward"
+    )
+    with pytest.raises(InvalidOperationError, match="not sorted"):
+        q.collect(engine="streaming")
+
+
+def test_join_asof_not_sorted_streaming_no_output_28527(
+    plmonkeypatch: PlMonkeyPatch,
+) -> None:
+    # No output is computed from right rows before they are checked.
+    plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "1")
+    right = pl.LazyFrame({"t": [1, 0, *range(2, 100)]})
+    q = pl.LazyFrame({"t": range(5, 100)}).join_asof(right, on="t")
+    batches = []
+    with pytest.raises(InvalidOperationError, match="not sorted"):
+        batches.extend(q.collect_batches(engine="streaming"))
+    assert batches == []
+
+
 @pytest.mark.parametrize(
     ("nulls_last", "groups", "expected_v"),
     [

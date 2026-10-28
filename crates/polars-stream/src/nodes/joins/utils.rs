@@ -122,6 +122,14 @@ impl SpillFrameSearchBuffer {
         top
     }
 
+    /// Drops the first `n` rows, without cloning the buffer as [`Self::split_at`] does.
+    pub(super) fn drop_front(&mut self, n: usize) {
+        let n = n.min(self.total_rows);
+        self.skip_rows += n;
+        self.total_rows -= n;
+        self.gc();
+    }
+
     pub(super) fn slice(mut self, offset: usize, len: usize) -> Self {
         self.skip_rows += offset;
         self.total_rows -= offset;

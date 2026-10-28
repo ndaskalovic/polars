@@ -502,6 +502,9 @@ fn is_sorted_rec(
             // in a row, so the sorted columns of that side stay sorted.
             match &args.how {
                 JoinType::Inner | JoinType::Left if keeps_left_order => rec!(*input_left),
+                // An as-of join emits every left row once, in order.
+                #[cfg(feature = "asof_join")]
+                JoinType::AsOf(_) => rec!(*input_left),
                 #[cfg(feature = "semi_anti_join")]
                 JoinType::Semi | JoinType::Anti if keeps_left_order => rec!(*input_left),
                 JoinType::Inner | JoinType::Right if keeps_right_order => {

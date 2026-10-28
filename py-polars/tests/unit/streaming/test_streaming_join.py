@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -1086,3 +1089,101 @@ def test_streaming_join_keeps_height_of_input_without_columns(
         q.collect(engine="in-memory"),
         check_row_order=False,
     )
+
+
+@pytest.mark.parametrize("strategy", ["backward", "forward", "nearest"])
+@pytest.mark.parametrize("by", [None, "g"])
+@pytest.mark.parametrize("null_keys", [False, True])
+def test_streaming_asof_join_dispatched_in_pieces_28527(
+    strategy: AsofJoinStrategy,
+    by: str | None,
+    null_keys: bool,
+    plmonkeypatch: PlMonkeyPatch,
+) -> None:
+    # Enough right rows for a left morsel to be cut into pieces, with runs of equal keys
+    # across the cuts; without the sortedness check, null left keys may come last.
+    plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "1000")
+    rng = np.random.default_rng(0)
+    order = [by, "t"] if by else ["t"]
+
+    def frame(n: int) -> pl.DataFrame:
+        t = pl.Series(rng.integers(0, 1_000, n))
+        if null_keys:
+            t = t.set(pl.Series(rng.random(n) < 0.1), None)
+        return pl.DataFrame({"g": rng.integers(0, 3, n), "t": t, "v": range(n)})
+
+    lf = frame(2_000).sort(order, nulls_last=null_keys).lazy()
+    rf = frame(10_000).drop_nulls().sort(order).lazy()
+    q = lf.join_asof(
+        rf, on="t", by=by, strategy=strategy, check_sortedness=not null_keys
+    )
+    assert "asof-join" in q.show_graph(
+        engine="streaming", plan_stage="physical", raw_output=True
+    )
+    assert_frame_equal(q.collect(engine="streaming"), q.collect(engine="in-memory"))
+
+
+def test_streaming_asof_join_morsel_across_phases_28527(
+    plmonkeypatch: PlMonkeyPatch,
+) -> None:
+    # A left morsel whose pieces are cut in several phases is sent in the last one.
+    plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "7")
+    rng = np.random.default_rng(1001)
+    rf = pl.LazyFrame({"g": range(1_000), "t": [0] * 1_000})
+    lf = pl.DataFrame(
+        {"g": rng.integers(0, 1_000, 1_000), "t": rng.integers(0, 10, 1_000)}
+    ).sort("g", "t")
+    q = lf.lazy().join_asof(rf, on="t", by="g")
+    assert_frame_equal(q.collect(engine="streaming"), q.collect(engine="in-memory"))
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="reads VmHWM from /proc"
+)
+def test_streaming_asof_join_memory_28527() -> None:
+    # One left row at the end of the day. The peak RSS of a fresh process: `ru_maxrss` of
+    # a child can be the parent's.
+    script = """\
+import sys
+import numpy as np
+import polars as pl
+
+n = 2_000_000
+right = pl.DataFrame({"g": np.zeros(n, dtype=np.int64), "t": np.arange(n)})
+left = right.tail(1)
+# Payload made per morsel, so buffered right rows cost new memory.
+right = right.lazy().with_columns((pl.col("t") + k).alias(f"v{k}") for k in range(4))
+if sys.argv[1] == "1":
+    left.lazy().set_sorted("g").join_asof(right.set_sorted("g"), on="t", by="g").collect(
+        engine="streaming"
+    )
+print(next(l for l in open("/proc/self/status") if l.startswith("VmHWM")).split()[1])
+"""
+
+    def peak_kb(join: bool) -> int:
+        cmd = [sys.executable, "-c", script, str(int(join))]
+        env = {**os.environ, "POLARS_MAX_THREADS": "1"}
+        return int(subprocess.check_output(cmd, env=env))
+
+    # Holding the right side (64MB of payload) would exceed this.
+    assert peak_kb(join=True) - peak_kb(join=False) < 30_000
+
+
+def test_streaming_asof_join_chain_streams_28527() -> None:
+    rng = np.random.default_rng(0)
+    quotes = pl.DataFrame(
+        {"g": rng.integers(0, 5, 400), "t": rng.integers(0, 999, 400)}
+    )
+    q = pl.DataFrame({"g": [0, 1, 2], "t": [5, 50, 500]}).lazy().set_sorted("g")
+    for h in [1, 10, 100]:
+        q = q.with_columns(k=pl.col("t") + h).join_asof(
+            quotes.sort("g", "t").lazy().set_sorted("g"),
+            left_on="k",
+            right_on="t",
+            by="g",
+            suffix=f"_{h}",
+        )
+    plan = q.show_graph(engine="streaming", plan_stage="physical", raw_output=True)
+    assert plan.count("asof-join") == 3
+    assert_frame_equal(q.collect(engine="streaming"), q.collect(engine="in-memory"))
