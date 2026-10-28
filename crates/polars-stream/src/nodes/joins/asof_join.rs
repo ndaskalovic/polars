@@ -7,7 +7,6 @@ use polars_async::primitives::distributor_channel as dc;
 use polars_async::primitives::wait_group::WaitGroup;
 use polars_core::prelude::row_encode::_get_rows_encoded_ca;
 use polars_core::prelude::*;
-use polars_core::utils::accumulate_dataframes_vertical_unchecked;
 use polars_defs::join::{AsOfOptions, AsofStrategy, JoinArgs, JoinType};
 use polars_ooc::RandomSpillContext;
 use polars_ops::frame::is_sorted::DataFrameIsSorted;
@@ -918,7 +917,8 @@ async fn compute_asof_join(
 
     drop_columns(&mut left_df, &mut right_df, params)?;
 
-    let mut out_right = Vec::with_capacity(left_groups.run_lengths.len());
+    // The right row each left row matches, gathered once for all groups.
+    let mut take = Vec::with_capacity(left_df.height());
     for (left_start, left_group_len) in left_groups_iter {
         let right_chunk_len =
             // SAFETY: the iterator results will be in-bounds.
@@ -958,16 +958,16 @@ async fn compute_asof_join(
             options.allow_eq,
         )?;
 
-        out_right.push(
-            right_df
-                .slice(right_start as i64, right_chunk_len)
-                .take(&take_idx)?,
+        take.extend(
+            take_idx
+                .iter()
+                .map(|i| i.map(|i| i + right_start as IdxSize)),
         );
     }
 
-    let initial = DataFrame::empty_with_arc_schema(right_df.schema().clone());
-    let out_right =
-        accumulate_dataframes_vertical_unchecked([initial].into_iter().chain(out_right));
+    let take = IdxCa::from_iter_options(PlSmallStr::EMPTY, take.into_iter());
+    // SAFETY: each index is in bounds of its group's slice of `right_df`, offset by its start.
+    let out_right = unsafe { right_df.take_unchecked(&take) };
     _finish_join(left_df, out_right, params.args.suffix.clone())
 }
 
