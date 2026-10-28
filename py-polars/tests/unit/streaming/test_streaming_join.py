@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -1086,3 +1089,64 @@ def test_streaming_join_keeps_height_of_input_without_columns(
         q.collect(engine="in-memory"),
         check_row_order=False,
     )
+
+
+@pytest.mark.parametrize("strategy", ["backward", "forward", "nearest"])
+@pytest.mark.parametrize("by", [["g"], ["g", "h"]])
+def test_streaming_asof_join_groups_sent_apart_28527(
+    strategy: AsofJoinStrategy, by: list[str], plmonkeypatch: PlMonkeyPatch
+) -> None:
+    # Enough right rows per left morsel for its leading groups to be sent on their own.
+    plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "100")
+    rng = np.random.default_rng(0)
+
+    def frame(n: int) -> pl.DataFrame:
+        g, h, t = (
+            rng.integers(0, 30, n),
+            rng.integers(0, 10, n),
+            rng.integers(0, 1_000, n),
+        )
+        return pl.DataFrame({"g": g, "h": h, "t": t, "v": range(n)}).sort(*by, "t")
+
+    q = (
+        frame(1_000)
+        .lazy()
+        .join_asof(frame(20_000).lazy(), on="t", by=by, strategy=strategy)
+    )
+    assert_frame_equal(q.collect(engine="streaming"), q.collect(engine="in-memory"))
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="reads VmHWM from /proc"
+)
+@pytest.mark.parametrize("groups", [1, 20_000])
+def test_streaming_asof_join_memory_28527(groups: int) -> None:
+    # One left row at the end of each group: one group covers the right rows dropped as
+    # they arrive, many groups the groups sent apart. VmHWM rather than `ru_maxrss`,
+    # which on Linux survives exec, so a child can report pytest's peak.
+    script = """\
+import sys
+import numpy as np
+import polars as pl
+
+n, groups = 2_000_000, int(sys.argv[1])
+g = np.repeat(np.arange(groups), n // groups)
+right = pl.DataFrame({"g": g, "t": np.tile(np.arange(n // groups), groups)})
+left = right.group_by("g", maintain_order=True).last()
+# Payload made per morsel, so buffered right rows cost new memory.
+right = right.lazy().with_columns((pl.col("t") + k).alias(f"v{k}") for k in range(4))
+if "join" in sys.argv:
+    left.lazy().set_sorted("g").join_asof(right.set_sorted("g"), on="t", by="g").collect(
+        engine="streaming"
+    )
+print(next(l for l in open("/proc/self/status") if l.startswith("VmHWM")).split()[1])
+"""
+
+    def peak_kb(*args: str) -> int:
+        cmd = [sys.executable, "-c", script, str(groups), *args]
+        env = {**os.environ, "POLARS_MAX_THREADS": "1"}
+        return int(subprocess.check_output(cmd, env=env))
+
+    # Holding the right side (64MB of payload) would exceed this.
+    assert peak_kb("join") - peak_kb() < 30_000

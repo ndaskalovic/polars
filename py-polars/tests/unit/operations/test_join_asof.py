@@ -1487,6 +1487,44 @@ def test_join_asof_not_sorted_streaming_grouped_27457(
 
 
 @pytest.mark.parametrize(
+    ("left", "right", "morsel_size"),
+    [
+        # Unsorted rows dropped before any right row was sent to a worker.
+        ([9], [2, 0, 1, 2, 4], "1"),
+        # 6 is sent to a worker, then 3 is dropped without being sent.
+        ([1, 2, 100, 101], [5, 6, 3, 50, 200, 201], "2"),
+    ],
+)
+def test_join_asof_not_sorted_streaming_pruned_28527(
+    left: list[int], right: list[int], morsel_size: str, plmonkeypatch: PlMonkeyPatch
+) -> None:
+    plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", morsel_size)
+    q = pl.LazyFrame({"t": left}).join_asof(
+        pl.LazyFrame({"t": right}), on="t", strategy="forward"
+    )
+    with pytest.raises(InvalidOperationError, match="not sorted"):
+        q.collect(engine="streaming")
+
+
+@pytest.mark.parametrize("strategy", ["backward", "forward", "nearest"])
+def test_join_asof_streaming_null_left_keys_last_28527(
+    strategy: AsofJoinStrategy, plmonkeypatch: PlMonkeyPatch
+) -> None:
+    # A group ending in a null key still needs the right rows of its other keys.
+    plmonkeypatch.setenv("POLARS_IDEAL_MORSEL_SIZE", "4")
+    left = pl.LazyFrame({"g": [0, 0, 0, 1], "t": [1, 5, None, 1]}).set_sorted("g")
+    right = pl.LazyFrame({"g": [0] * 6 + [1] * 2, "t": [1, 2, 3, 4, 5, 6, 0, 9]})
+    q = left.join_asof(
+        right.with_row_index("rid").set_sorted("g"),
+        on="t",
+        by="g",
+        strategy=strategy,
+        check_sortedness=False,
+    )
+    assert_frame_equal(q.collect(engine="streaming"), q.collect(engine="in-memory"))
+
+
+@pytest.mark.parametrize(
     ("nulls_last", "groups", "expected_v"),
     [
         (False, [None, 0, 1], [None, 8, 9]),
