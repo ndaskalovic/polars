@@ -96,6 +96,17 @@ impl SpillFrameSearchBuffer {
         unsafe { series_get_bypass_validity(series, frame_index, bypass_validity) }.into_static()
     }
 
+    /// The `row_index`th row of the `columns`.
+    pub(super) async fn row<'a>(
+        &self,
+        row_index: usize,
+        columns: impl IntoIterator<Item = &'a PlSmallStr>,
+    ) -> PolarsResult<DataFrame> {
+        let (frame, frame_index) = self.spillframe_at(row_index);
+        let df = frame.get().await.select(columns.into_iter().cloned())?;
+        Ok(df.slice(frame_index as i64, 1))
+    }
+
     pub(super) async fn push_sf(&mut self, sf: SpillFrame) {
         assert!(!self.frozen);
         let added_rows = sf.height();

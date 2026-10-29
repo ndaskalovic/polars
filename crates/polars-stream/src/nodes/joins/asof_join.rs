@@ -429,17 +429,81 @@ async fn covered_len(
     right: &SpillFrameSearchBuffer,
     params: &AsOfJoinParams,
 ) -> PolarsResult<usize> {
-    // Needing more right rows is monotone in the prefix, and all of `left` needs more.
+    let options = params.as_of_options();
+    let reorder_iter = Iterator::zip(params.by_descending.iter(), params.by_nulls_last.iter());
+    let last = right.height() - 1;
+
+    // The group of the last right row, and where its rows start.
+    let mut right_group = Vec::with_capacity(params.right_by().len());
+    let mut start = 0;
+    for (right_by, (descending, nulls_last)) in
+        Iterator::zip(params.right_by().iter(), reorder_iter.clone())
+    {
+        // SAFETY: `last` is in bounds.
+        let group = unsafe { right.get_unchecked(right_by, last).await };
+        let cmp = |a: &AnyValue<'_>| reorder_cmp(a, &group, *descending, *nulls_last).is_ge();
+        start = right.binary_search(cmp, right_by, start..).await;
+        right_group.push(group);
+    }
+
+    // A left row of the last group has its matches if its key is below `bound` (or equal to it,
+    // unless `strict`).
+    let key = params.right.key_col();
+    // SAFETY: `last` is in bounds.
+    let last_key = unsafe { right.get_unchecked(key, last).await };
+    let (bound, strict) = match (options.strategy, options.allow_eq) {
+        (Forward, true) | (Backward, false) => (Some(last_key), false),
+        (Forward, false) | (Backward, true) => (Some(last_key), true),
+        (Nearest, _) => {
+            // A nearest match needs a greater key after it, so the left key must be below the key
+            // before the last run of equal ones.
+            let run_start = right.binary_search(|x| *x >= last_key, key, start..).await;
+            let before = if run_start > start {
+                // SAFETY: `run_start - 1` is in bounds.
+                Some(unsafe { right.get_unchecked(key, run_start - 1).await })
+            } else {
+                None
+            };
+            (before, true)
+        },
+    };
+
+    let left_key_col = left.column(params.left.key_col())?;
+    let left_key = left_key_col.as_materialized_series();
+    let left_by = params
+        .left_by()
+        .iter()
+        .map(|c| Ok(left.column(c)?.as_materialized_series()))
+        .collect::<PolarsResult<Vec<_>>>()?;
+    let has_matches = |i: usize| {
+        let group_ord = Iterator::zip(left_by.iter(), right_group.iter())
+            .zip(reorder_iter.clone())
+            // SAFETY: `i` is in bounds.
+            .map(|((s, g), (d, nl))| reorder_cmp(&unsafe { s.get_unchecked(i) }, g, *d, *nl))
+            .find(|ord| ord.is_ne())
+            .unwrap_or(Ordering::Equal);
+        match (group_ord, &bound) {
+            (Ordering::Less, _) => true,
+            (Ordering::Equal, Some(bound)) => {
+                // SAFETY: `i` is in bounds.
+                let k = unsafe { left_key.get_unchecked(i) };
+                if strict { k < *bound } else { k <= *bound }
+            },
+            _ => false,
+        }
+    };
+
+    // The first row without its matches, where rows with a null key match nothing and so take
+    // the last other row before them. Rows having their matches come first, and the last
+    // non-null row of `left` does not have them.
     let (mut lo, mut hi) = (0, left.height() - 1);
     while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if right_range_end(&left.slice(0, mid), right, params)
-            .await?
-            .is_none()
-        {
-            hi = mid - 1;
+        let mid = lo + (hi - lo) / 2;
+        let last_non_null = left_key_col.slice(0, mid + 1).last_non_null();
+        if last_non_null.is_none_or(&has_matches) {
+            lo = mid + 1;
         } else {
-            lo = mid;
+            hi = mid;
         }
     }
     Ok(lo)
@@ -489,22 +553,15 @@ async fn check_right_continuity(
     let sorted_by_nulls_last = params.by_nulls_last.iter().chain([&false]);
     // Right keys are never null (filtered before the node), so the rows either side of the
     // split suffice.
-    let offset = split_at_idx.saturating_sub(1);
-    let df = dfsb
-        .clone()
-        .slice(offset, 2)
-        .into_df()
-        .await
-        .select(sorted_by_cols.clone())?;
-    let split_at_idx = split_at_idx - offset;
-    let before_split = df.slice(0, split_at_idx);
-    let after_split = df.slice(split_at_idx as i64, df.height() - split_at_idx);
-    let last_non_null = before_split.column(key_col_name)?.last_non_null();
-    let first_non_null = after_split.column(key_col_name)?.first_non_null();
-    let before_split_point_row = last_non_null
-        .map(|pos| before_split.slice(pos as i64, 1))
-        .or(last_non_null_row.clone());
-    let after_split_point_row = first_non_null.map(|pos| after_split.slice(pos as i64, 1));
+    let before_split_point_row = match split_at_idx.checked_sub(1) {
+        Some(idx) => Some(dfsb.row(idx, sorted_by_cols.clone()).await?),
+        None => last_non_null_row.clone(),
+    };
+    let after_split_point_row = if split_at_idx < dfsb.height() {
+        Some(dfsb.row(split_at_idx, sorted_by_cols.clone()).await?)
+    } else {
+        None
+    };
     check_continuity(
         before_split_point_row.clone(),
         after_split_point_row,
@@ -533,13 +590,15 @@ where
     if let Some(before_split_point) = before_split_point_row
         && let Some(after_split_point) = after_split_point_row
     {
-        let across_split_point = before_split_point.vstack(&after_split_point)?;
-        if !across_split_point.is_sorted(
-            &sorted_by_cols.cloned().collect_vec(),
-            &sorted_by_descending.cloned().collect_vec(),
-            &sorted_by_nulls_last.cloned().collect_vec(),
-        )? {
-            return Err(not_sorted_err());
+        let reorder_iter = Iterator::zip(sorted_by_descending, sorted_by_nulls_last);
+        for (col, (descending, nulls_last)) in Iterator::zip(sorted_by_cols, reorder_iter) {
+            let before = before_split_point.column(col)?.get(0)?;
+            let after = after_split_point.column(col)?.get(0)?;
+            match reorder_cmp(&before, &after, *descending, *nulls_last) {
+                Ordering::Less => break,
+                Ordering::Equal => {},
+                Ordering::Greater => return Err(not_sorted_err()),
+            }
         }
     }
     Ok(())
