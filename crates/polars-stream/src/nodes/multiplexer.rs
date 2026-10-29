@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use polars_async::executor::TaskMetricAggregator;
 use polars_async::primitives::wait_group::WaitGroup;
 use polars_ooc::{MostRecentSpillContext, ParameterFreeSpillContext, SpillFrame};
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::Notify;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::compute_node_prelude::*;
 use crate::morsel::SourceToken;
@@ -20,6 +22,32 @@ impl BufferedStream {
             VecDeque::new(),
             MostRecentSpillContext::new("multiplexer".into(), task_metrics),
         )
+    }
+}
+
+/// Receives a consumer's morsels, counting each off the morsels waiting for it.
+struct WaitingReceiver {
+    rx: UnboundedReceiver<(SpillFrame, MorselSeq, SourceToken)>,
+    waiting: Arc<AtomicUsize>,
+    received: Arc<Notify>,
+}
+
+impl WaitingReceiver {
+    async fn recv(&mut self) -> Option<(SpillFrame, MorselSeq, SourceToken)> {
+        let morsel = self.rx.recv().await;
+        if morsel.is_some() {
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
+            self.received.notify_one();
+        }
+        morsel
+    }
+}
+
+impl Drop for WaitingReceiver {
+    fn drop(&mut self) {
+        // Close first, so the multiplexer sees this consumer gone when it wakes.
+        self.rx.close();
+        self.received.notify_one();
     }
 }
 
@@ -131,7 +159,7 @@ impl ComputeNode for MultiplexerNode {
         scope: &'s TaskScope<'s, 'env>,
         recv_ports: &mut [Option<RecvPort<'_>>],
         send_ports: &mut [Option<SendPort<'_>>],
-        _state: &'s StreamingExecutionState,
+        state: &'s StreamingExecutionState,
         join_handles: &mut Vec<JoinHandle<PolarsResult<()>>>,
     ) {
         assert!(recv_ports.len() == 1 && !send_ports.is_empty());
@@ -141,6 +169,7 @@ impl ComputeNode for MultiplexerNode {
             Active(
                 UnboundedSender<(SpillFrame, MorselSeq, SourceToken)>,
                 MostRecentSpillContext,
+                Arc<AtomicUsize>,
             ),
             Buffering(
                 &'a mut VecDeque<(SpillFrame, MorselSeq)>,
@@ -150,6 +179,8 @@ impl ComputeNode for MultiplexerNode {
         }
 
         let buffered_source_token = SourceToken::new();
+        let received = Arc::new(Notify::new());
+        let max_waiting = state.num_pipelines;
 
         let (mut buf_senders, buf_receivers): (Vec<_>, Vec<_>) = self
             .buffers
@@ -158,8 +189,14 @@ impl ComputeNode for MultiplexerNode {
             .map(|(port_idx, buffer)| {
                 if let BufferedStream::Open(buf, ctx) = buffer {
                     if send_ports[port_idx].is_some() {
-                        let (rx, tx) = unbounded_channel();
-                        (Listener::Active(rx, ctx.clone()), Some((buf, tx)))
+                        let (tx, rx) = unbounded_channel();
+                        let waiting = Arc::<AtomicUsize>::default();
+                        let rx = WaitingReceiver {
+                            rx,
+                            waiting: waiting.clone(),
+                            received: received.clone(),
+                        };
+                        (Listener::Active(tx, ctx.clone(), waiting), Some((buf, rx)))
                     } else {
                         (Listener::Buffering(buf, ctx.clone()), None)
                     }
@@ -173,6 +210,21 @@ impl ComputeNode for MultiplexerNode {
             let buffered_source_token = buffered_source_token.clone();
             join_handles.push(scope.spawn_task(TaskPriority::High, async move {
                 loop {
+                    // Read ahead only while some consumer has few morsels waiting, or a source
+                    // faster than all its consumers buffers all of its output here.
+                    loop {
+                        let waiting = buf_senders.iter().filter_map(|l| match l {
+                            Listener::Active(tx, _, waiting) if !tx.is_closed() => {
+                                Some(waiting.load(Ordering::Relaxed))
+                            },
+                            _ => None,
+                        });
+                        if waiting.min().is_none_or(|w| w < max_waiting) {
+                            break;
+                        }
+                        received.notified().await;
+                    }
+
                     let Ok(mut morsel) = receiver.recv().await else {
                         break;
                     };
@@ -183,11 +235,12 @@ impl ComputeNode for MultiplexerNode {
                     let seq = morsel.seq();
                     for buf_sender in &mut buf_senders {
                         match buf_sender {
-                            Listener::Active(s, ctx) => {
+                            Listener::Active(tx, ctx, waiting) => {
                                 let source_token = morsel.source_token().clone();
                                 let sf = morsel.sf().clone();
                                 ctx.register(&sf).await;
-                                match s.send((sf, seq, source_token)) {
+                                waiting.fetch_add(1, Ordering::Relaxed);
+                                match tx.send((sf, seq, source_token)) {
                                     Ok(_) => {
                                         anyone_interested = true;
                                         active_listener_interested = true;
